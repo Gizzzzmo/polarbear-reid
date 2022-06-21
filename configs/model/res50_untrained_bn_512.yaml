@@ -1,0 +1,15 @@
+BACKBONE:
+    ARCHITECTURE: RESNET_TRUNK
+    KWARGS:
+        depth: 50
+        pretrained: false
+        instance_norm: false
+EMBEDDER:
+    ARCHITECTURE: SIMPLE_MLP
+    ARGS:
+        - 512
+CLASSIFIER:
+    ARCHITECTURE: MLP_CLASSIFIER
+    KWARGS:
+        depth: 1
+        num_features: 512

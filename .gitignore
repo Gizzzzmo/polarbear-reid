@@ -1,0 +1,8 @@
+start_experiments.sh
+plots
+logs/**
+data/**
+*.ipynb
+**.pyc
+__pycache__
+train_scripts
