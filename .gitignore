@@ -1,7 +1,7 @@
 start_experiments.sh
 plots
-logs/**
-data/**
+logs
+data
 *.ipynb
 **.pyc
 __pycache__
