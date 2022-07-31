@@ -208,7 +208,12 @@ class SimpleMLP(nn.Module):
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.fcs(x)
-        
+
+class Identity(nn.Module):
+    def __init__(self, input_layer_size: int) -> None:
+        super().__init__()
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x
 
 class MLPClassifier(nn.Module):
     def __init__(self, num_classes: int, depth: int = 1, num_features: int = 2048) -> None:
@@ -239,7 +244,8 @@ class MLPClassifier(nn.Module):
 model_zoo = {
     "RESNET_TRUNK": ResNetTrunk,
     "MLP_CLASSIFIER": MLPClassifier,
-    "SIMPLE_MLP": SimpleMLP    
+    "SIMPLE_MLP": SimpleMLP,
+    "IDENTITY": Identity
 }
 
 def build_module_from_config(config: dict, *overwrite, **koverwrite) -> nn.Module:
@@ -260,3 +266,31 @@ def build_metric_learning_network(config: dict, nums_classes: Sequence[int]) -> 
     
     model = MetricLearningNetwork(backbone, embedder, classifiers)
     return model
+
+try:
+    import timm
+    class BigTransfer(nn.Module):
+        def __init__(self, pretrained: bool = True):
+            super().__init__()
+            self.base = timm.create_model('resnetv2_101x1_bitm', pretrained=pretrained)
+    
+        def forward(self, x: dict, for_eval=False) -> torch.Tensor:
+            x = x['imgs']
+            for name, module in self.base._modules.items():
+                if name == 'head':
+                    break
+                x = module(x)
+
+            x = F.avg_pool2d(x, x.size()[2:])
+            x = x.view(x.size(0), -1)
+            
+            return x
+        
+        def get_output_dimension(self):
+            return self.base.head.fc.in_channels
+    
+    model_zoo['BIG_TRANSFER'] = BigTransfer
+    
+except ImportError:
+    print("Warning: timm is not installed. You will not be able to use the TIMM feature extractor.")
+    

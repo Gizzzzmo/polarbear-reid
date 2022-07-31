@@ -6,3 +6,4 @@ data
 **.pyc
 __pycache__
 train_scripts
+.vscode

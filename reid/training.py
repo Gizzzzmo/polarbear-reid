@@ -3,10 +3,9 @@ import torch
 from os import path as osp
 from torch.autograd import Variable
 from torch.optim import Optimizer
-from typing import List, Optional, Sequence, Tuple
+from typing import Optional, Sequence, Tuple, Union
 
-from reid.logging import MetricsLogger
-
+from .metric_logging import MetricsLogger
 from .utils import mkdir_if_missing, AverageMeter
 from .models import MetricLearningNetwork
 from .dataset import Dataset
@@ -16,7 +15,7 @@ from .evaluation import accuracy
 class Trainer:
     def __init__(
         self,
-        model: MetricLearningNetwork,
+        model: Union[MetricLearningNetwork, torch.nn.DataParallel],
         optimizer: Optimizer,
         classification_loss: torch.nn.Module,
         triplet_loss: torch.nn.Module,
@@ -52,7 +51,6 @@ class Trainer:
         
         print(f'Start training epoch {epoch}')
         self.model.train()
-        print(f'blub 1')
                 
         batch_time = AverageMeter()
         data_time = AverageMeter()
@@ -61,19 +59,12 @@ class Trainer:
         trp_losses = AverageMeter()
         accuracies = AverageMeter()
 
-        print(f'blub 2')
         end = time.time()
-        data_loaders = []
-        for train_set in train_sets:
-            print(train_set.train_loader)
-            itt = iter(train_set.train_loader)
-            print(itt)
-            data_loaders.append(itt)
-        #data_loaders = [iter(train_set.train_loader) for train_set in train_sets]
-        print(f'blub 3')
+        
+        data_loaders = [iter(train_set.train_loader) for train_set in train_sets]
+        
         i = 0
         done = False
-        print(f'blub 4')
         
         while True:
             overall_classification_loss = AverageMeter()
@@ -159,7 +150,6 @@ class Trainer:
                 )
             i += 1
         
-        print(f'blub 5')
         if self.logger is not None:
             self.logger['epoch'] = epoch
             self.logger['loss'] = losses.avg
@@ -167,7 +157,6 @@ class Trainer:
             self.logger['triplet_loss'] = trp_losses.avg
             self.logger['accuracy'] = accuracies.avg
             self.logger.write_row()
-        print(f'blub 6')
             
         return losses.avg, cls_losses.avg, trp_losses.avg, accuracies.avg
 

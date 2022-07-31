@@ -7,8 +7,11 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.neural_network import MLPClassifier
 from sklearn.semi_supervised import LabelPropagation
 from sklearn.svm import SVC
-from sklearn.metrics import average_precision_score, cohen_kappa_score, f1_score, accuracy_score, adjusted_rand_score, rand_score
+from sklearn.metrics import average_precision_score, cohen_kappa_score, f1_score, accuracy_score, adjusted_rand_score, rand_score, confusion_matrix
 
+
+def predictions(output: torch.Tensor):
+    return output.topk(1, 1)[1].cpu().numpy()
 
 def accuracy(output: torch.Tensor, target: np.array, tracklets: Optional[np.array] = None):
     _, pred = output.topk(1, 1)
@@ -59,14 +62,23 @@ def best_matching_accuracy(predicted_clusters, gt_clusters):
             weight_matrix[cluster_id, gt_cluster_id] = np.sum((predicted_clusters == cluster_id) & (gt_clusters == gt_cluster_id))
 
     pred_indices, gt_indices = linear_sum_assignment(weight_matrix, maximize=True)
-    return pred_indices, gt_indices, weight_matrix[pred_indices, gt_indices].sum()/num_samples
+    remapped_predicted_clusters = predicted_clusters.copy()
+    for i, j in zip(pred_indices, gt_indices):
+        remapped_predicted_clusters[predicted_clusters == i] = j
+        
+    f1 = f1_score(gt_clusters, remapped_predicted_clusters, average='weighted')
+    acc = accuracy_score(gt_clusters, remapped_predicted_clusters)
+    kappa = cohen_kappa_score(gt_clusters, remapped_predicted_clusters)
+    mAP = average_precision_score(gt_clusters, remapped_predicted_clusters)
+    
+    return pred_indices, gt_indices, acc, f1, kappa, mAP
 
 def evaluate_cluster(predictions, labels):
     non_noise = np.sum(predictions != -1)/len(predictions)
-    map1, map2, acc = best_matching_accuracy(predictions, labels)
+    map1, map2, acc, f1, kappa, mAP = best_matching_accuracy(predictions, labels)
     acc = acc * non_noise
     
-    return map1, map2, acc
+    return map1, map2, acc, f1, kappa, mAP
 
 def evaluate_rand_index(predictions, labels):
     assert np.all(np.array(predictions.shape) == np.array(labels.shape))
@@ -121,7 +133,7 @@ def query_gallery_logreg(samples, masks, labels, tracklets):
             query_vector_labels = labels[query_mask]
             query_vector_tracklets = tracklets[query_mask]
             
-            logreg = LogisticRegression(max_iter=1000)
+            logreg = LogisticRegression(max_iter=10000)
             logreg.fit(gallery_vectors, gallery_vector_labels)
             predictions = logreg.predict(query_vectors)
             

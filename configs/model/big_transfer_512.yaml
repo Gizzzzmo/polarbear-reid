@@ -1,0 +1,13 @@
+BACKBONE:
+    ARCHITECTURE: BIG_TRANSFER
+    KWARGS:
+        pretrained: true
+EMBEDDER:
+    ARCHITECTURE: SIMPLE_MLP
+    ARGS:
+        - 512
+CLASSIFIER:
+    ARCHITECTURE: MLP_CLASSIFIER
+    KWARGS:
+        depth: 1
+        num_features: 512

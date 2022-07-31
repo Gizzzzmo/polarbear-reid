@@ -1,61 +1,16 @@
 import datetime
 import argparse
-from io import TextIOWrapper
 import os
-import sys
-import fcntl
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
-from torchvision import transforms as T
-from itertools import chain
-from typing import List, Sequence, Tuple
+from typing import Sequence
 
 from reid.clustering import k_means
 from reid.utils import mkdir_if_missing, read_yaml, write_yaml, extract_output
-from reid.dataset import Dataset, create, Preprocessor
-from reid.training import Trainer
-from reid.models import MetricLearningNetwork, build_metric_learning_network
-from reid.loss import losses
-from reid.logging import MetricsLogger
+from reid.dataset import Dataset
+from reid.models import MetricLearningNetwork
+from reid.configuration import setup_train_logging, setup_model, setup_trainer, setup_datasets
 from reid import evaluation
-
-def setup_logging(logs_dir: str, resume_config: dict, output_to_file: bool) -> Tuple[str, MetricsLogger, TextIOWrapper]:
-    
-    mkdir_if_missing(logs_dir)
-    
-    if 'RUN_LOG_DIR' in resume_config:
-        run_dir = resume_config['RUN_LOG_DIR']
-        mkdir_if_missing(run_dir)
-    else:
-        with open(os.path.join(logs_dir, '.lock'), 'w') as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
-            
-            dirs = next(os.walk(logs_dir))[1]
-            i = 1
-            while f'Run_{i}' in dirs:
-                i += 1
-                
-            run_dir = os.path.join(logs_dir, f'Run_{i}')
-            mkdir_if_missing(run_dir)
-            
-    lock = open(os.path.join(run_dir, '.lock'), 'w')
-    try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except:
-        print('Can\'t resume run inplace, since training is still ongoing')
-    
-    if output_to_file:
-        sys.stdout = open(os.path.join(run_dir, 'stdout.txt'), 'a')
-    
-    print(f'Logging to {run_dir}')
-    
-    train_logger = MetricsLogger(
-        metrics=('epoch', 'loss', 'classification_loss', 'triplet_loss', 'accuracy'),
-        dest_path=os.path.join(run_dir, 'train_log.csv')
-    )
-        
-    return run_dir, train_logger, lock
 
 def save_starting_config(run_log_dir: str, resume_config: dict, training_config: dict, model_config: dict):
     training_config_path = os.path.abspath(os.path.join(run_log_dir, 'training_config.yaml'))
@@ -70,165 +25,7 @@ def save_starting_config(run_log_dir: str, resume_config: dict, training_config:
     write_yaml(resume_config, os.path.join(run_log_dir, 'starting_config.yaml'))
         
     resume_config['RUN_LOG_DIR'] = run_log_dir
-    
 
-def setup_datasets(
-    dataset_names: Sequence[str],
-    monitor_dataset_names: Sequence[str],
-    single_head: bool,
-    data_config: dict,
-    data_dir: str,
-    run_log_dir: str
-    ) -> Tuple[Sequence[Dataset], Sequence[Dataset]]:
-    
-    batch_size = data_config['BATCH_SIZE']
-    ids_per_batch = data_config['IDS_PER_BATCH']
-    width = data_config['WIDTH']
-    height = data_config['HEIGHT']    
-    
-    normalizer = T.Normalize(mean=[0.485, 0.456, 0.406],
-                             std=[0.229, 0.224, 0.225])
-    
-    train_transformer = T.Compose([
-        T.Resize((height, width)),
-        T.RandomHorizontalFlip(),
-        T.ToTensor(),
-        normalizer,
-        T.RandomErasing(p=0.5, scale=(0.2, 0.2), ratio=(0.3, 0.3))
-    ])
-    
-    test_transformer = T.Compose([
-        T.Resize((height, width)),
-        T.ToTensor(),
-        normalizer,
-    ])
-    
-    train_sets, monitor_sets = [], []
-    
-    classification_metrics = ('accuracy', 'kappa', 'f1')
-    classification_metrics = classification_metrics + tuple(f'{metric}_tracklet' for metric in classification_metrics)
-    cluster_metrics = ('k_means_accuracy', 'k_means_kappa', 'k_means_f1', 'k_means_rand', 'k_means_adj_rand')
-    query_gallery_metrics = (
-        '1nn_accuracy', '1nn_kappa', '1nn_f1', '1nn_mAP',
-        'logreg_accuracy', 'logreg_kappa', 'logreg_f1', 'logreg_mAP',
-        'svm_accuracy', 'svm_kappa', 'svm_f1', 'svm_mAP'
-    )
-    query_gallery_metrics = query_gallery_metrics + tuple(f'{metric}_tracklet' for metric in query_gallery_metrics)
-    
-    label_offset = 0
-    for i, name in enumerate(dataset_names):
-        name, val_folds = name.split(':')
-        
-        root = os.path.join(data_dir, name)
-        dataset = create(
-            name,
-            root,
-            classifier_idx=0 if single_head else i, validation_folds=val_folds.split(','),
-            label_offset=label_offset
-        )
-        
-        dataset.train_loader = DataLoader(
-            Preprocessor(
-                dataset.train,
-                root=dataset.images_dir,
-                transform=train_transformer
-            ),
-            batch_size=batch_size, num_workers=1,
-            shuffle=True,
-            pin_memory=True, drop_last=True
-        )
-
-        dataset.val_loader = DataLoader(
-            Preprocessor(
-                dataset.val,
-                root=dataset.images_dir,
-                transform=test_transformer
-            ),
-            batch_size=batch_size, num_workers=1,
-            shuffle=False, pin_memory=True
-        )
-        
-        composed_query_gallery_metrics = tuple(
-            f'{qgm}_{size}_{j}'
-                for qgm in query_gallery_metrics
-                for size in dataset.gallery_sizes
-                for j in range(dataset.qg_masks.shape[1])
-        )
-        metrics = ('epoch',) + classification_metrics + cluster_metrics + composed_query_gallery_metrics
-        
-        dataset.logger = MetricsLogger(
-            metrics,
-            os.path.join(run_log_dir, f'{name}_train_metrics.csv')
-        )
-        
-        train_sets.append(dataset)
-        if single_head:
-            label_offset += dataset.num_train_ids
-    
-    for name in monitor_dataset_names:
-        name, val_folds = name.split(':')
-        root = os.path.join(data_dir, name)
-        dataset = create(name, root, validation_folds=val_folds.split(','))
-        
-        dataset.val_loader = DataLoader(
-            Preprocessor(
-                dataset.val,
-                root=dataset.images_dir,
-                transform=test_transformer
-            ),
-            batch_size=batch_size, num_workers=1,
-            shuffle=False, pin_memory=True
-        )
-        
-        composed_query_gallery_metrics = tuple(
-            f'{qgm}_{size}_{j}'
-                for qgm in query_gallery_metrics
-                for size in dataset.gallery_sizes
-                for j in range(dataset.qg_masks.shape[1])
-        )
-        metrics = ('epoch',) + cluster_metrics + composed_query_gallery_metrics
-        
-        dataset.logger = MetricsLogger(
-            metrics,
-            os.path.join(run_log_dir, f'{name}_train_metrics.csv')
-        )
-        
-        monitor_sets.append(dataset)
-    
-    return tuple(train_sets), tuple(monitor_sets)
-
-def setup_model(
-    model_config: str,
-    train_sets: Sequence[Dataset],
-    single_head: bool,
-    resume_config: dict,
-    run_log_dir: str
-    ) -> MetricLearningNetwork:
-    
-    if single_head:
-        nums_classes = [sum(dataset.num_train_ids for dataset in train_sets)]
-    else:
-        nums_classes = [dataset.num_train_ids for dataset in train_sets]
-        
-    model = build_metric_learning_network(model_config, nums_classes=nums_classes)
-    if 'BACKBONE_WEIGHTS' in resume_config:
-        model.load_backbone(resume_config['BACKBONE_WEIGHTS'])
-    if 'EMBEDDER_WEIGHTS' in resume_config:
-        model.load_embedder(resume_config['EMBEDDER_WEIGHTS'])
-    
-    if 'CLASSIFIERS' in resume_config and len(resume_config['CLASSIFIERS']) != 0:
-        if single_head:
-            model.load_classifier(resume_config['CLASSIFIERS'][0]['CLASSIFIER_WEIGHTS'], 0)
-            pass
-        else:
-            for i, dataset in enumerate(train_sets):
-                for classifier in resume_config['CLASSIFIERS']:
-                    names = classifier['DATASETS']
-                    if dataset.name in names:
-                        model.load_classifier(classifier['CLASSIFIER_WEIGHTS'], i)
-                        break
-                
-    return model.cuda()
 
 def configure_dataset_loader_starting_point(
     train_sets: Sequence[Dataset],
@@ -238,70 +35,6 @@ def configure_dataset_loader_starting_point(
     
     # TODO: implement
     pass
-
-def setup_trainer(
-    training_config: dict,
-    model: MetricLearningNetwork,
-    logger: MetricsLogger,
-    print_freq: int,
-    resume_config: dict,
-    run_log_dir: str
-    ) -> Trainer:
-    
-    classification_loss_config = training_config['CLASSIFICATION_LOSS']
-    args = classification_loss_config.get('ARGS', [])
-    kwargs = classification_loss_config.get('KWARGS', {})
-    classification_loss = losses[classification_loss_config['NAME']](*args, **kwargs).cuda()
-    
-    triplet_loss_config = training_config['TRIPLET_LOSS']
-    args = triplet_loss_config.get('ARGS', [])
-    kwargs = triplet_loss_config.get('KWARGS', {})
-    triplet_loss = losses[triplet_loss_config['NAME']](*args, **kwargs).cuda()
-    
-    triplet_weight = training_config['TRIPLET_WEIGHT']
-    global_triplet_loss = training_config['GLOBAL_TRIPLET_LOSS']
-    network_input_key = training_config['NETWORK_INPUT_KEY']
-    
-    optimier_config = training_config['OPTIMIZER']
-    
-    param_groups = [
-        {
-            'params': model.module.backbone.parameters(),
-            'lr': optimier_config['BACKBONE_LR_MULT'] * optimier_config['LEARN_RATE']
-        },
-        {
-            'params': model.module.metric_embedder.parameters(),
-            'lr': optimier_config['EMBEDDER_LR_MULT'] * optimier_config['LEARN_RATE']
-        },
-        {
-            'params': chain(*(classifier.parameters() for classifier in model.module.classifiers)),
-            'lr': optimier_config['CLASSIFIER_LR_MULT'] * optimier_config['LEARN_RATE']
-        }
-    ]
-    
-    optimizer = torch.optim.Adam(
-        param_groups,
-        lr=optimier_config['LEARN_RATE'],
-        weight_decay=optimier_config['WEIGHT_DECAY']
-    )
-    
-    if 'OPTIMIZER' in resume_config:
-        optimizer.load_state_dict(torch.load(resume_config['OPTIMIZER']))
-    
-    trainer = Trainer(
-        model,
-        optimizer,
-        classification_loss,
-        triplet_loss,
-        triplet_weight,
-        global_triplet_loss,
-        network_input_key,
-        logger,
-        print_freq,
-        run_log_dir
-    )
-    
-    return trainer
 
 def log_qg_metrics(
     dataset: Dataset,
@@ -321,7 +54,7 @@ def log_qg_metrics(
                 dataset.logger[f'{technique}_mAP{tracklet_corrected}_{size}_{j}'] = mAPs[i, j, k]
                 
     print(f'\n\nQuery-gallery evaluation with {technique}:\n')
-    print('Gallery size:       ', ','.join(f'    {size:<6}' for size in dataset.gallery_sizes))
+    print(f'Gallery size:       ', ','.join(f'    {size:<6}' for size in dataset.gallery_sizes))
     print(f'                    {accuracies[:, :, 0].mean(axis=1)} +/- {accuracies[:, :, 0].std(axis=1)} (accuracies)')
     print(f'                    {mAPs[:, :, 0].mean(axis=1)      } +/- {mAPs[:, :, 0].std(axis=1)      } (mean-AP)')
     print(f'Image based:        {f1s[:, :, 0].mean(axis=1)       } +/- {f1s[:, :, 0].std(axis=1)       } (f1-scores)')
@@ -343,6 +76,9 @@ def evaluate(
     
     critical_accuracy = 0
     
+    all_pids = []
+    all_classifications = []
+    
     for dataset in train_sets:
         logger = dataset.logger
         logger['epoch'] = epoch
@@ -352,6 +88,11 @@ def evaluate(
             dataset.val_loader,
             dataset.classifer_idx
         )
+        print(pids.shape, classifications.shape)
+        pred = evaluation.predictions(classifications)
+        all_pids.append(pids)
+        all_classifications.append(pred)
+        
         print(f'Evaluating model on {dataset.name}:\n')
         
         accuracy, f1, kappa = evaluation.accuracy(classifications, pids)
@@ -377,11 +118,14 @@ def evaluate(
         
         predictions = k_means(features, dataset.num_val_ids)
         print(f'\nKmeans cluster evaluation:\n')
-        _, _, acc = evaluation.evaluate_cluster(predictions, pids)
+        _, _, acc, f1, kappa, mAP = evaluation.evaluate_cluster(predictions, pids)
         adj_rand_score, rand_score = evaluation.evaluate_rand_index(predictions, pids)
         logger['k_means_rand'] = rand_score
         logger['k_means_adj_rand'] = adj_rand_score
         logger['k_means_accuracy'] = acc
+        logger['k_means_f1'] = f1
+        logger['k_means_kappa'] = kappa
+        logger['k_means_mAP'] = mAP
         print(f'Rand score:          {rand_score}')
         print(f'Adjusted Rand score: {adj_rand_score}')
         
@@ -395,7 +139,20 @@ def evaluate(
         log_qg_metrics(dataset, 'svm', accuracies, f1s, kappas, mAPs)
         
         logger.write_row()
+    
+    if len(all_classifications) > 0:
+        all_classifications = np.concatenate(all_classifications, axis=0)
+        all_pids = np.concatenate(all_pids, axis=0)    
         
+        confusion = evaluation.confusion_matrix(all_classifications, all_pids)
+        print('\nConfusion matrix:')
+        print(confusion)
+        
+        np.save(
+            '/'.join(logger.dest_path.split('/')[:-1]) + f'/confusion.npy',
+            confusion
+        )
+    
     for dataset in monitor_sets:
         logger = dataset.logger
         logger['epoch'] = epoch
@@ -409,11 +166,14 @@ def evaluate(
         
         predictions = k_means(features, dataset.num_val_ids)
         print(f'Kmeans cluster evaluation:\n')
-        _, _, acc = evaluation.evaluate_cluster(predictions, pids)
+        _, _, acc, f1, kappa, mAP = evaluation.evaluate_cluster(predictions, pids)
         adj_rand_score, rand_score = evaluation.evaluate_rand_index(predictions, pids)
         logger['k_means_rand'] = rand_score
         logger['k_means_adj_rand'] = adj_rand_score
         logger['k_means_accuracy'] = acc
+        logger['k_means_f1'] = f1
+        logger['k_means_kappa'] = kappa
+        logger['k_means_mAP'] = mAP
         print(f'Rand score:          {rand_score}')
         print(f'Adjusted Rand score: {adj_rand_score}')
         
@@ -429,7 +189,7 @@ def evaluate(
         logger.write_row()
         
         
-    return float(critical_accuracy/len(train_sets))
+    return float(critical_accuracy/len(train_sets)) if len(train_sets) > 0 else float('nan')
 
 def save_checkpoint(
     epoch: int,
@@ -440,14 +200,15 @@ def save_checkpoint(
     resume_config: dict,
     run_log_dir: str,
     sub_dir: str
-):
+    ):
+    
     dest_dir = os.path.join(run_log_dir, sub_dir)
     mkdir_if_missing(dest_dir)
     
     optimizer_path = os.path.abspath(os.path.join(dest_dir, 'optimizer.pth'))
     torch.save(optimizer.state_dict(), optimizer_path)
     
-    backbone_path = os.path.abspath(os.path.join(dest_dir, 'backbone.pth'))    
+    backbone_path = os.path.abspath(os.path.join(dest_dir, 'backbone.pth'))
     model.save_backbone(backbone_path)
     
     embedder_path = os.path.abspath(os.path.join(dest_dir, 'embedder.pth'))
@@ -473,7 +234,7 @@ def save_checkpoint(
     
     resume_config_path = os.path.join(dest_dir, 'resume.yaml')
     write_yaml(resume_config, resume_config_path)   
-    
+
 
 def main(args):
     if args.gpu_devices is not None:
@@ -482,7 +243,7 @@ def main(args):
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     
-    run_log_dir, train_logger, _ = setup_logging(args.logs_dir, args.resume_config, args.output_to_file)
+    run_log_dir, train_logger, lock = setup_train_logging(args.logs_dir, args.resume_config, args.output_to_file)
     
     if 'RUN_LOG_DIR' not in args.resume_config:
         save_starting_config(
@@ -505,8 +266,7 @@ def main(args):
         args.model_config,
         train_sets,
         args.training_config['SINGLE_HEAD'],
-        args.resume_config,
-        run_log_dir
+        args.resume_config
     )
     
     starting_epoch = args.starting_epoch
@@ -528,13 +288,11 @@ def main(args):
     print(f'Training process starts @ {datetime.datetime.now():%Y-%m-%d %H:%M:%S}')
     
     for i in range(starting_epoch, starting_epoch + args.epochs):
-        print('hi')
         
         if args.create_embedding_sequence_upto is None or i >= args.create_embedding_sequence_upto >= 0:
             save_embeddings_freq = 0
         else:
             save_embeddings_freq = args.save_embeddings_freq
-        print('hihi')
         
         trainer.train(
             i,
@@ -542,7 +300,6 @@ def main(args):
             monitor_sets,
             save_embeddings_freq
         )
-        print('hihihi')
         
         critical_accuracy = evaluate(i, model, train_sets, monitor_sets)
         
@@ -581,6 +338,8 @@ def main(args):
         print(f'  Avg Accuracy:  {critical_accuracy:.4f}')
         print(f'  Best Accuracy: {best_accuracy    :.4f}')
         print(f'\n-------------------------------\n')
+    
+    lock.close()
     
 
 if __name__ == '__main__':

@@ -53,12 +53,41 @@ def load_run_data(path: str) -> pd.DataFrame:
     conf = read_yaml(os.path.join(path, 'starting_config.yaml'))
     model_conf = read_yaml(conf['MODEL_CONFIG'])
     train_conf = read_yaml(conf['TRAIN_CONFIG'])
+    frozen_trunk = train_conf['OPTIMIZER']['BACKBONE_LR_MULT'] == 0
     train_sets = list(map(lambda x: tuple(x.split(':')), conf['DATASETS']))
     monitor_sets = list(map(lambda x: tuple(x.split(':')), conf['MONITOR_DATASETS']))
     pretrained = model_conf['BACKBONE']['KWARGS']['pretrained']
     single_head = train_conf['SINGLE_HEAD']
     
-    return dataset_metrics, train_metrics, train_sets, monitor_sets, pretrained, single_head
+    return dataset_metrics, train_metrics, train_sets, monitor_sets, pretrained, single_head, frozen_trunk
+
+def load_test_data(path: str) -> pd.DataFrame:
+    dataset_metrics = glob.glob(os.path.join(path, '*_test_metrics.csv'))
+    dataset_metrics = dict(map(
+        lambda x: (
+            x.split('/')[-1].split('_test_metrics.csv')[0],
+            x
+        ),
+        dataset_metrics
+    ))
+    conf = read_yaml(os.path.join(path, 'test_config.yaml'))
+    model_conf = read_yaml(conf['MODEL_CONFIG'])
+    if 'TRAIN_CONFIG' in conf:
+        train_conf = read_yaml(conf['TRAIN_CONFIG'])
+        single_head = train_conf['SINGLE_HEAD']
+        frozen_trunk = train_conf['OPTIMIZER']['BACKBONE_LR_MULT'] == 0
+    else:
+        single_head = None
+        frozen_trunk = None
+    
+    if 'DATASETS' in conf:
+        train_sets = list(map(lambda x: tuple(x.split(':')), conf['DATASETS']))
+    else:
+        train_sets = None
+    monitor_sets = list(map(lambda x: tuple(x.split(':')), conf['MONITOR_DATASETS']))
+    pretrained = model_conf['BACKBONE']['KWARGS']['pretrained']
+    
+    return dataset_metrics, train_sets, monitor_sets, pretrained, single_head, frozen_trunk
 
 def view_all_runs(logs_dir: str):
     for tgt in sorted(glob.glob(os.path.join(logs_dir, '*')), key=lambda x: int(x.split('_')[-1])):
